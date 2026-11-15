@@ -1,0 +1,41 @@
+name: Build WeChatVideo2Voice Dylib
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch SILK v3 C SDK source
+        run: |
+          git clone --depth 1 https://github.com/kn007/silk-v3-decoder.git silk_sdk
+
+      - name: Compile WeChatVideo2Voice.dylib
+        run: |
+          clang -arch arm64 \
+            -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -O2 \
+            -Wno-deprecated-declarations \
+            -Isilk_sdk/silk/interface \
+            -Isilk_sdk/silk/src \
+            -dynamiclib \
+            -framework UIKit \
+            -framework Foundation \
+            -framework AVFoundation \
+            -framework CoreMedia \
+            Video2Voice.m silk_sdk/silk/src/*.c \
+            -o WeChatVideo2Voice.dylib
+
+      - name: Upload compiled dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: WeChatVideo2Voice-dylib
+          path: WeChatVideo2Voice.dylib
