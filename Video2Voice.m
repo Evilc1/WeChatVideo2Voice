@@ -1,64 +1,77 @@
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <CoreMedia/CoreMedia.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include "SKP_Silk_SDK_API.h"
 
 // ==========================================
-// 1. 悬浮提示 HUD（实时反馈提取与发送进度）
+// 1. 强置顶悬浮提示 HUD（防止被微信窗口遮挡）
 // ==========================================
 static UILabel *gToastLabel = nil;
 
-static UIWindow *V2V_GetKeyWindow(void) {
+static UIWindow *V2V_GetMainWindow(void) {
+    UIWindow *targetWin = nil;
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
             UIWindowScene *ws = (UIWindowScene *)scene;
             for (UIWindow *w in ws.windows) {
-                if (w.isKeyWindow) return w;
+                if (!w.hidden && w.alpha > 0.01 && w.windowLevel == UIWindowLevelNormal) {
+                    targetWin = w;
+                    if (w.isKeyWindow) return w;
+                }
             }
         }
     }
-    return [UIApplication sharedApplication].windows.firstObject;
+    if (!targetWin && [[UIApplication sharedApplication].delegate respondsToSelector:@selector(window)]) {
+        targetWin = [[UIApplication sharedApplication].delegate window];
+    }
+    if (!targetWin) {
+        targetWin = [UIApplication sharedApplication].windows.firstObject;
+    }
+    return targetWin;
 }
 
 static void V2V_ShowToast(NSString *text, NSTimeInterval duration) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *win = V2V_GetKeyWindow();
+        UIWindow *win = V2V_GetMainWindow();
         if (!win) return;
 
         if (!gToastLabel) {
             gToastLabel = [[UILabel alloc] init];
-            gToastLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.82];
+            gToastLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.86];
             gToastLabel.textColor = [UIColor whiteColor];
-            gToastLabel.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightMedium];
+            gToastLabel.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightSemibold];
             gToastLabel.textAlignment = NSTextAlignmentCenter;
             gToastLabel.numberOfLines = 0;
             gToastLabel.layer.cornerRadius = 10.0;
             gToastLabel.layer.masksToBounds = YES;
+            gToastLabel.layer.zPosition = 999999;
         }
 
         gToastLabel.text = text;
-        CGSize maxSize = CGSizeMake(win.bounds.size.width - 80.0, 120.0);
+        CGSize maxSize = CGSizeMake(win.bounds.size.width - 72.0, 140.0);
         CGSize textSize = [gToastLabel sizeThatFits:maxSize];
         CGFloat w = textSize.width + 36.0;
         CGFloat h = textSize.height + 22.0;
-        gToastLabel.frame = CGRectMake((win.bounds.size.width - w) * 0.5, (win.bounds.size.height - h) * 0.5, w, h);
+        gToastLabel.frame = CGRectMake((win.bounds.size.width - w) * 0.5, (win.bounds.size.height - h) * 0.45, w, h);
 
-        if (!gToastLabel.superview) {
-            [win addSubview:gToastLabel];
-        }
+        [win addSubview:gToastLabel];
+        [win bringSubviewToFront:gToastLabel];
         gToastLabel.alpha = 1.0;
 
-        [NSObject cancelPreviousPerformRequestsWithTarget:gToastLabel];
         if (duration > 0) {
+            NSString *snapshotText = [text copy];
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(duration * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [UIView animateWithDuration:0.25 animations:^{
-                    gToastLabel.alpha = 0.0;
-                } completion:^(BOOL finished) {
-                    if (gToastLabel.alpha == 0.0) {
-                        [gToastLabel removeFromSuperview];
-                    }
-                }];
+                if ([gToastLabel.text isEqualToString:snapshotText]) {
+                    [UIView animateWithDuration:0.25 animations:^{
+                        gToastLabel.alpha = 0.0;
+                    } completion:^(BOOL finished) {
+                        if (gToastLabel.alpha == 0.0) {
+                            [gToastLabel removeFromSuperview];
+                        }
+                    }];
+                }
             });
         }
     });
@@ -86,7 +99,6 @@ static NSData *V2V_Extract24kMonoPCMFromVideo(NSString *videoPath, NSError **out
         return nil;
     }
 
-    // 先解码为 24000Hz 双声道 16-bit PCM，保留完整左右声道混响能量
     NSDictionary *outputSettings = @{
         AVFormatIDKey: @(kAudioFormatLinearPCM),
         AVSampleRateKey: @(24000.0),
@@ -135,7 +147,7 @@ static NSData *V2V_Extract24kMonoPCMFromVideo(NSString *videoPath, NSError **out
     float *monoFloat = (float *)malloc(frameCount * sizeof(float));
     if (!monoFloat) return nil;
 
-    // 1) 防相位抵消单声道混缩（避免左右声道混响直接相减丢失空间感）
+    // 防相位抵消混缩（完整保留左右声道混响尾音）
     float maxPeak = 0.0001f;
     for (NSUInteger i = 0; i < frameCount; i++) {
         float L = (float)stereoSamples[i * 2];
@@ -146,11 +158,7 @@ static NSData *V2V_Extract24kMonoPCMFromVideo(NSString *videoPath, NSError **out
         if (absVal > maxPeak) maxPeak = absVal;
     }
 
-    // 2) 安全峰值归一化（仅当混缩后超过 -0.5dB 上限时等比例压回，不破坏原声动态）
-    float scale = 1.0f;
-    if (maxPeak > 30900.0f) {
-        scale = 30900.0f / maxPeak;
-    }
+    float scale = (maxPeak > 30900.0f) ? (30900.0f / maxPeak) : 1.0f;
 
     NSMutableData *monoPCMData = [NSMutableData dataWithLength:frameCount * sizeof(int16_t)];
     int16_t *monoOut = (int16_t *)monoPCMData.mutableBytes;
@@ -186,20 +194,18 @@ static NSData *V2V_EncodePCMToMaxSilk(const int16_t *samples, NSUInteger sampleC
         return nil;
     }
 
-    // 锁定微信语音条协议上限参数
     SKP_SILK_SDK_EncControlStruct encControl;
     memset(&encControl, 0, sizeof(encControl));
     encControl.API_sampleRate = 24000;
     encControl.maxInternalSampleRate = 24000;
-    encControl.packetSize = 480;         // 20ms 一帧 @ 24kHz
-    encControl.bitRate = 40000;          // 40kbps 最高码率
+    encControl.packetSize = 480;
+    encControl.bitRate = 40000;
     encControl.packetLossPercentage = 0;
-    encControl.complexity = 2;           // 最高编码精度
-    encControl.useInBandFEC = 0;         // 关闭纠错冗余，码率全留给音质
-    encControl.useDTX = 0;               // 关闭静音压缩，完整保留混响与气音尾音
+    encControl.complexity = 2;
+    encControl.useInBandFEC = 0;
+    encControl.useDTX = 0;
 
     NSMutableData *silkOut = [NSMutableData data];
-    // 写入微信标准 SILK_V3 头部（0x02 + "#!SILK_V3"）
     const uint8_t header[10] = { 0x02, '#', '!', 'S', 'I', 'L', 'K', '_', 'V', '3' };
     [silkOut appendBytes:header length:sizeof(header)];
 
@@ -230,7 +236,7 @@ static NSData *V2V_EncodePCMToMaxSilk(const int16_t *samples, NSUInteger sampleC
 }
 
 // ==========================================
-// 4. 构造微信语音消息并发送（支持超 60 秒自动切片）
+// 4. 构造微信 8.0.75 语音消息并发送（含 m_dtVoice 内存数据赋值）
 // ==========================================
 static NSString *V2V_GetSelfUserName(void) {
     Class settingUtil = objc_getClass("SettingUtil");
@@ -254,8 +260,12 @@ static NSString *V2V_GetSelfUserName(void) {
 }
 
 static NSString *V2V_ResolveTargetChatUserName(id origMsgWrap, NSString *selfUsrName) {
-    NSString *fromUsr = [origMsgWrap valueForKey:@"m_nsFromUsr"];
-    NSString *toUsr = [origMsgWrap valueForKey:@"m_nsToUsr"];
+    NSString *fromUsr = nil;
+    NSString *toUsr = nil;
+    @try {
+        fromUsr = [origMsgWrap valueForKey:@"m_nsFromUsr"];
+        toUsr = [origMsgWrap valueForKey:@"m_nsToUsr"];
+    } @catch (NSException *e) {}
 
     if ([fromUsr hasSuffix:@"@chatroom"]) return fromUsr;
     if ([toUsr hasSuffix:@"@chatroom"]) return toUsr;
@@ -265,15 +275,15 @@ static NSString *V2V_ResolveTargetChatUserName(id origMsgWrap, NSString *selfUsr
     return fromUsr.length > 0 ? fromUsr : toUsr;
 }
 
-static void V2V_SendSingleSilkChunk(NSData *silkData, uint32_t durationMs, NSString *selfUsr, NSString *targetUsr) {
+static BOOL V2V_SendSingleSilkChunk(NSData *silkData, uint32_t durationMs, NSString *selfUsr, NSString *targetUsr) {
     Class msgWrapCls = objc_getClass("CMessageWrap");
     Class centerCls = objc_getClass("MMServiceCenter");
     Class msgMgrCls = objc_getClass("CMessageMgr");
-    if (!msgWrapCls || !centerCls || !msgMgrCls || !silkData || targetUsr.length == 0) return;
+    if (!msgWrapCls || !centerCls || !msgMgrCls || !silkData || targetUsr.length == 0) return NO;
 
     id voiceWrap = ((id (*)(id, SEL))objc_msgSend)(msgWrapCls, @selector(alloc));
     voiceWrap = ((id (*)(id, SEL, unsigned int))objc_msgSend)(voiceWrap, @selector(initWithMsgType:), 34);
-    if (!voiceWrap) return;
+    if (!voiceWrap) return NO;
 
     @try {
         if (selfUsr.length > 0) [voiceWrap setValue:selfUsr forKey:@"m_nsFromUsr"];
@@ -281,49 +291,71 @@ static void V2V_SendSingleSilkChunk(NSData *silkData, uint32_t durationMs, NSStr
         [voiceWrap setValue:@(34) forKey:@"m_uiMessageType"];
         [voiceWrap setValue:@(4) forKey:@"m_uiVoiceFormat"]; // 4 = SILK_V3
         [voiceWrap setValue:@(durationMs) forKey:@"m_uiVoiceTime"];
+        [voiceWrap setValue:silkData forKey:@"m_dtVoice"];    // 关键修复：微信发送语音依赖内存字节流
         [voiceWrap setValue:@((uint32_t)[[NSDate date] timeIntervalSince1970]) forKey:@"m_uiCreateTime"];
         [voiceWrap setValue:@(1) forKey:@"m_uiStatus"];
     } @catch (NSException *e) {}
 
-    if (![msgWrapCls respondsToSelector:@selector(GetPathOfAudio:)]) return;
-    NSString *audioPath = ((NSString * (*)(id, SEL, id))objc_msgSend)(msgWrapCls, @selector(GetPathOfAudio:), voiceWrap);
-    if (audioPath.length == 0) return;
-
-    NSString *dir = [audioPath stringByDeletingLastPathComponent];
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-
-    if (![silkData writeToFile:audioPath atomically:YES]) return;
+    // 同步写入本地缓存路径，确保本地自己点开也能秒播放
+    if ([msgWrapCls respondsToSelector:@selector(GetPathOfAudio:)]) {
+        NSString *audioPath = ((NSString * (*)(id, SEL, id))objc_msgSend)(msgWrapCls, @selector(GetPathOfAudio:), voiceWrap);
+        if (audioPath.length > 0) {
+            NSString *dir = [audioPath stringByDeletingLastPathComponent];
+            [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+            [silkData writeToFile:audioPath atomically:YES];
+        }
+    }
 
     id center = ((id (*)(id, SEL))objc_msgSend)(centerCls, @selector(defaultCenter));
     id msgMgr = ((id (*)(id, SEL, Class))objc_msgSend)(center, @selector(getService:), msgMgrCls);
-    if (!msgMgr) return;
+    if (!msgMgr) return NO;
 
     if ([msgMgr respondsToSelector:@selector(AddAudioMsg:MsgWrap:)]) {
         ((void (*)(id, SEL, id, id))objc_msgSend)(msgMgr, @selector(AddAudioMsg:MsgWrap:), targetUsr, voiceWrap);
+        return YES;
     } else if ([msgMgr respondsToSelector:@selector(AddMsg:MsgWrap:)]) {
         ((void (*)(id, SEL, id, id))objc_msgSend)(msgMgr, @selector(AddMsg:MsgWrap:), targetUsr, voiceWrap);
+        return YES;
     }
+    return NO;
+}
+
+static NSString *V2V_ResolveVideoFilePath(id videoMsgWrap) {
+    Class msgWrapCls = objc_getClass("CMessageWrap");
+    if (!msgWrapCls) return nil;
+
+    SEL selectors[] = {
+        NSSelectorFromString(@"GetPathOfMesVideo:"),
+        NSSelectorFromString(@"GetTempPathOfMesVideo:")
+    };
+
+    for (int i = 0; i < 2; i++) {
+        if ([msgWrapCls respondsToSelector:selectors[i]]) {
+            NSString *path = ((NSString * (*)(id, SEL, id))objc_msgSend)(msgWrapCls, selectors[i], videoMsgWrap);
+            if (path.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
+                return path;
+            }
+        }
+    }
+    return nil;
 }
 
 static void V2V_ProcessAndSendVideoWrap(id videoMsgWrap) {
-    if (!videoMsgWrap) return;
-
-    Class msgWrapCls = objc_getClass("CMessageWrap");
-    if (!msgWrapCls || ![msgWrapCls respondsToSelector:@selector(GetPathOfMesVideo:)]) {
-        V2V_ShowToast(@"未找到视频路径接口", 2.0);
+    if (!videoMsgWrap) {
+        V2V_ShowToast(@"未获取到视频消息数据", 2.0);
         return;
     }
 
-    NSString *videoPath = ((NSString * (*)(id, SEL, id))objc_msgSend)(msgWrapCls, @selector(GetPathOfMesVideo:), videoMsgWrap);
-    if (videoPath.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:videoPath]) {
-        V2V_ShowToast(@"视频尚未加载完成，请先点开播放后再转语音条", 2.5);
+    NSString *videoPath = V2V_ResolveVideoFilePath(videoMsgWrap);
+    if (videoPath.length == 0) {
+        V2V_ShowToast(@"请先点开播放一下该视频，加载完再转语音条", 2.5);
         return;
     }
 
     NSString *selfUsr = V2V_GetSelfUserName();
     NSString *targetUsr = V2V_ResolveTargetChatUserName(videoMsgWrap, selfUsr);
     if (targetUsr.length == 0) {
-        V2V_ShowToast(@"无法识别当前聊天对象", 2.0);
+        V2V_ShowToast(@"无法识别当前聊天窗口对象", 2.0);
         return;
     }
 
@@ -340,7 +372,6 @@ static void V2V_ProcessAndSendVideoWrap(id videoMsgWrap) {
         const int16_t *allSamples = (const int16_t *)pcmData.bytes;
         NSUInteger totalSamples = pcmData.length / sizeof(int16_t);
 
-        // 微信语音条单条上限 60 秒，按 59 秒（24000 * 59 = 1416000 采样点）安全分段
         const NSUInteger maxSamplesPerChunk = 24000 * 59;
         NSMutableArray<NSData *> *silkChunks = [NSMutableArray array];
         NSMutableArray<NSNumber *> *chunkDurations = [NSMutableArray array];
@@ -361,13 +392,14 @@ static void V2V_ProcessAndSendVideoWrap(id videoMsgWrap) {
             return;
         }
 
-        // 按顺序发送到当前聊天窗口（多段时间隔 0.35 秒防乱序）
         for (NSUInteger i = 0; i < silkChunks.count; i++) {
             NSData *chunk = silkChunks[i];
             uint32_t ms = [chunkDurations[i] unsignedIntValue];
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                V2V_SendSingleSilkChunk(chunk, ms, selfUsr, targetUsr);
-                if (i == silkChunks.count - 1) {
+                BOOL ok = V2V_SendSingleSilkChunk(chunk, ms, selfUsr, targetUsr);
+                if (!ok) {
+                    V2V_ShowToast(@"发送失败：未匹配到微信 8.0.75 语音发送接口", 2.5);
+                } else if (i == silkChunks.count - 1) {
                     NSString *tip = (silkChunks.count > 1)
                         ? [NSString stringWithFormat:@"已发送 %lu 条高清语音 (24kHz/40kbps)", (unsigned long)silkChunks.count]
                         : @"已发送高清语音条 (24kHz/40kbps)";
@@ -379,7 +411,7 @@ static void V2V_ProcessAndSendVideoWrap(id videoMsgWrap) {
 }
 
 // ==========================================
-// 5. Hook 微信 8.0.75 视频气泡长按菜单
+// 5. Hook 微信 8.0.75 消息气泡长按菜单
 // ==========================================
 static void V2V_SwizzleMethod(Class cls, SEL origSel, SEL newSel) {
     if (!cls) return;
@@ -411,6 +443,7 @@ static id V2V_CreateMenuItem(id target, SEL action) {
 }
 
 static id V2V_ExtractMsgWrapFromCellView(id cellView) {
+    if (!cellView) return nil;
     id viewModel = nil;
     if ([cellView respondsToSelector:@selector(viewModel)]) {
         viewModel = ((id (*)(id, SEL))objc_msgSend)(cellView, @selector(viewModel));
@@ -420,9 +453,24 @@ static id V2V_ExtractMsgWrapFromCellView(id cellView) {
     }
     @try {
         return [cellView valueForKeyPath:@"viewModel.messageWrap"];
-    } @catch (NSException *e) {
-        return nil;
+    } @catch (NSException *e) {}
+
+    // 兜底遍历实例变量提取 CMessageWrap
+    Class msgWrapCls = objc_getClass("CMessageWrap");
+    unsigned int count = 0;
+    Ivar *ivars = class_copyIvarList([cellView class], &count);
+    for (unsigned int i = 0; i < count; i++) {
+        const char *enc = ivar_getTypeEncoding(ivars[i]);
+        if (enc && enc[0] == '@') {
+            id obj = object_getIvar(cellView, ivars[i]);
+            if (msgWrapCls && [obj isKindOfClass:msgWrapCls]) {
+                free(ivars);
+                return obj;
+            }
+        }
     }
+    if (ivars) free(ivars);
+    return nil;
 }
 
 @implementation NSObject (V2VVideoCellMenuHook)
@@ -452,6 +500,8 @@ static id V2V_ExtractMsgWrapFromCellView(id cellView) {
 }
 
 - (void)v2v_onTapConvertVideoToVoice {
+    UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [feedback impactOccurred];
     id msgWrap = V2V_ExtractMsgWrapFromCellView(self);
     V2V_ProcessAndSendVideoWrap(msgWrap);
 }
@@ -464,13 +514,10 @@ static id V2V_ExtractMsgWrapFromCellView(id cellView) {
 __attribute__((constructor))
 static void V2VPluginInit(void) {
     @autoreleasepool {
-        Class videoCellCls = objc_getClass("VideoMessageCellView");
         Class commonCellCls = objc_getClass("CommonMessageCellView");
         SEL menuSel = NSSelectorFromString(@"operationMenuItems");
 
-        if (videoCellCls && class_getInstanceMethod(videoCellCls, menuSel)) {
-            V2V_SwizzleMethod(videoCellCls, menuSel, @selector(v2v_operationMenuItems));
-        } else if (commonCellCls && class_getInstanceMethod(commonCellCls, menuSel)) {
+        if (commonCellCls && class_getInstanceMethod(commonCellCls, menuSel)) {
             V2V_SwizzleMethod(commonCellCls, menuSel, @selector(v2v_operationMenuItems));
         }
     }
