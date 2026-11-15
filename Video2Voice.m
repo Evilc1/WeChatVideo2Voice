@@ -6,7 +6,7 @@
 #include "SKP_Silk_SDK_API.h"
 
 // ==========================================
-// 1. 强置顶悬浮提示 HUD（防止被微信窗口遮挡）
+// 1. 强置顶悬浮提示 HUD
 // ==========================================
 static UILabel *gToastLabel = nil;
 
@@ -39,7 +39,7 @@ static void V2V_ShowToast(NSString *text, NSTimeInterval duration) {
 
         if (!gToastLabel) {
             gToastLabel = [[UILabel alloc] init];
-            gToastLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.86];
+            gToastLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.88];
             gToastLabel.textColor = [UIColor whiteColor];
             gToastLabel.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightSemibold];
             gToastLabel.textAlignment = NSTextAlignmentCenter;
@@ -87,7 +87,7 @@ static NSData *V2V_Extract24kMonoPCMFromVideo(NSString *videoPath, NSError **out
     NSArray<AVAssetTrack *> *audioTracks = [asset tracksWithMediaType:AVMediaTypeAudio];
     if (audioTracks.count == 0) {
         if (outError) {
-            *outError = [NSError errorWithDomain:@"WeChatVideo2Voice" code:-1 userInfo:@{ NSLocalizedDescriptionKey: @"该视频不包含音轨" }];
+            *outError = [NSError errorWithDomain:@"WeChatVideo2Voice" code:-1 userInfo:@{ NSLocalizedDescriptionKey: @"该视频没有音轨" }];
         }
         return nil;
     }
@@ -147,7 +147,7 @@ static NSData *V2V_Extract24kMonoPCMFromVideo(NSString *videoPath, NSError **out
     float *monoFloat = (float *)malloc(frameCount * sizeof(float));
     if (!monoFloat) return nil;
 
-    // 防相位抵消混缩（完整保留左右声道混响尾音）
+    // 防相位抵消单声道混缩（完整保留左右声道混响尾音）
     float maxPeak = 0.0001f;
     for (NSUInteger i = 0; i < frameCount; i++) {
         float L = (float)stereoSamples[i * 2];
@@ -236,7 +236,7 @@ static NSData *V2V_EncodePCMToMaxSilk(const int16_t *samples, NSUInteger sampleC
 }
 
 // ==========================================
-// 4. 构造微信 8.0.75 语音消息并发送（含 m_dtVoice 内存数据赋值）
+// 4. 构造微信 8.0.75 语音消息并发送
 // ==========================================
 static NSString *V2V_GetSelfUserName(void) {
     Class settingUtil = objc_getClass("SettingUtil");
@@ -275,6 +275,18 @@ static NSString *V2V_ResolveTargetChatUserName(id origMsgWrap, NSString *selfUsr
     return fromUsr.length > 0 ? fromUsr : toUsr;
 }
 
+static void V2V_WriteAudioCacheForWrap(Class msgWrapCls, id voiceWrap, NSData *silkData) {
+    if (!msgWrapCls || !voiceWrap || !silkData) return;
+    if ([msgWrapCls respondsToSelector:@selector(GetPathOfAudio:)]) {
+        NSString *audioPath = ((NSString * (*)(id, SEL, id))objc_msgSend)(msgWrapCls, @selector(GetPathOfAudio:), voiceWrap);
+        if (audioPath.length > 0) {
+            NSString *dir = [audioPath stringByDeletingLastPathComponent];
+            [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+            [silkData writeToFile:audioPath atomically:YES];
+        }
+    }
+}
+
 static BOOL V2V_SendSingleSilkChunk(NSData *silkData, uint32_t durationMs, NSString *selfUsr, NSString *targetUsr) {
     Class msgWrapCls = objc_getClass("CMessageWrap");
     Class centerCls = objc_getClass("MMServiceCenter");
@@ -291,47 +303,58 @@ static BOOL V2V_SendSingleSilkChunk(NSData *silkData, uint32_t durationMs, NSStr
         [voiceWrap setValue:@(34) forKey:@"m_uiMessageType"];
         [voiceWrap setValue:@(4) forKey:@"m_uiVoiceFormat"]; // 4 = SILK_V3
         [voiceWrap setValue:@(durationMs) forKey:@"m_uiVoiceTime"];
-        [voiceWrap setValue:silkData forKey:@"m_dtVoice"];    // 关键修复：微信发送语音依赖内存字节流
+        [voiceWrap setValue:silkData forKey:@"m_dtVoice"];
         [voiceWrap setValue:@((uint32_t)[[NSDate date] timeIntervalSince1970]) forKey:@"m_uiCreateTime"];
         [voiceWrap setValue:@(1) forKey:@"m_uiStatus"];
     } @catch (NSException *e) {}
 
-    // 同步写入本地缓存路径，确保本地自己点开也能秒播放
-    if ([msgWrapCls respondsToSelector:@selector(GetPathOfAudio:)]) {
-        NSString *audioPath = ((NSString * (*)(id, SEL, id))objc_msgSend)(msgWrapCls, @selector(GetPathOfAudio:), voiceWrap);
-        if (audioPath.length > 0) {
-            NSString *dir = [audioPath stringByDeletingLastPathComponent];
-            [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-            [silkData writeToFile:audioPath atomically:YES];
-        }
-    }
+    // 发送前写入一次缓存
+    V2V_WriteAudioCacheForWrap(msgWrapCls, voiceWrap, silkData);
 
     id center = ((id (*)(id, SEL))objc_msgSend)(centerCls, @selector(defaultCenter));
     id msgMgr = ((id (*)(id, SEL, Class))objc_msgSend)(center, @selector(getService:), msgMgrCls);
     if (!msgMgr) return NO;
 
+    BOOL sent = NO;
     if ([msgMgr respondsToSelector:@selector(AddAudioMsg:MsgWrap:)]) {
         ((void (*)(id, SEL, id, id))objc_msgSend)(msgMgr, @selector(AddAudioMsg:MsgWrap:), targetUsr, voiceWrap);
-        return YES;
+        sent = YES;
     } else if ([msgMgr respondsToSelector:@selector(AddMsg:MsgWrap:)]) {
         ((void (*)(id, SEL, id, id))objc_msgSend)(msgMgr, @selector(AddMsg:MsgWrap:), targetUsr, voiceWrap);
-        return YES;
+        sent = YES;
     }
-    return NO;
+
+    // 发送后数据库会分配真实 m_uiMesLocalID，再按新 ID 路径补写一次缓存，保证本地秒播放
+    if (sent) {
+        V2V_WriteAudioCacheForWrap(msgWrapCls, voiceWrap, silkData);
+    }
+    return sent;
 }
 
 static NSString *V2V_ResolveVideoFilePath(id videoMsgWrap) {
     Class msgWrapCls = objc_getClass("CMessageWrap");
     if (!msgWrapCls) return nil;
 
-    SEL selectors[] = {
+    SEL classSels[] = {
         NSSelectorFromString(@"GetPathOfMesVideo:"),
         NSSelectorFromString(@"GetTempPathOfMesVideo:")
     };
-
     for (int i = 0; i < 2; i++) {
-        if ([msgWrapCls respondsToSelector:selectors[i]]) {
-            NSString *path = ((NSString * (*)(id, SEL, id))objc_msgSend)(msgWrapCls, selectors[i], videoMsgWrap);
+        if ([msgWrapCls respondsToSelector:classSels[i]]) {
+            NSString *path = ((NSString * (*)(id, SEL, id))objc_msgSend)(msgWrapCls, classSels[i], videoMsgWrap);
+            if (path.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
+                return path;
+            }
+        }
+    }
+
+    SEL instSels[] = {
+        NSSelectorFromString(@"GetPathOfMesVideo"),
+        NSSelectorFromString(@"getVideoPath")
+    };
+    for (int i = 0; i < 2; i++) {
+        if ([videoMsgWrap respondsToSelector:instSels[i]]) {
+            NSString *path = ((NSString * (*)(id, SEL))objc_msgSend)(videoMsgWrap, instSels[i]);
             if (path.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
                 return path;
             }
@@ -355,7 +378,7 @@ static void V2V_ProcessAndSendVideoWrap(id videoMsgWrap) {
     NSString *selfUsr = V2V_GetSelfUserName();
     NSString *targetUsr = V2V_ResolveTargetChatUserName(videoMsgWrap, selfUsr);
     if (targetUsr.length == 0) {
-        V2V_ShowToast(@"无法识别当前聊天窗口对象", 2.0);
+        V2V_ShowToast(@"无法识别当前聊天对象", 2.0);
         return;
     }
 
@@ -398,7 +421,7 @@ static void V2V_ProcessAndSendVideoWrap(id videoMsgWrap) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 BOOL ok = V2V_SendSingleSilkChunk(chunk, ms, selfUsr, targetUsr);
                 if (!ok) {
-                    V2V_ShowToast(@"发送失败：未匹配到微信 8.0.75 语音发送接口", 2.5);
+                    V2V_ShowToast(@"发送失败：未匹配到微信语音发送接口", 2.5);
                 } else if (i == silkChunks.count - 1) {
                     NSString *tip = (silkChunks.count > 1)
                         ? [NSString stringWithFormat:@"已发送 %lu 条高清语音 (24kHz/40kbps)", (unsigned long)silkChunks.count]
@@ -411,7 +434,7 @@ static void V2V_ProcessAndSendVideoWrap(id videoMsgWrap) {
 }
 
 // ==========================================
-// 5. Hook 微信 8.0.75 消息气泡长按菜单
+// 5. Hook 微信 8.0.75 视频气泡长按菜单（子类 + 父类全覆盖）
 // ==========================================
 static void V2V_SwizzleMethod(Class cls, SEL origSel, SEL newSel) {
     if (!cls) return;
@@ -455,7 +478,6 @@ static id V2V_ExtractMsgWrapFromCellView(id cellView) {
         return [cellView valueForKeyPath:@"viewModel.messageWrap"];
     } @catch (NSException *e) {}
 
-    // 兜底遍历实例变量提取 CMessageWrap
     Class msgWrapCls = objc_getClass("CMessageWrap");
     unsigned int count = 0;
     Ivar *ivars = class_copyIvarList([cellView class], &count);
@@ -473,34 +495,60 @@ static id V2V_ExtractMsgWrapFromCellView(id cellView) {
     return nil;
 }
 
-@implementation NSObject (V2VVideoCellMenuHook)
+static NSArray *V2V_AppendMenuIfNeeded(id cellView, id origItems) {
+    NSMutableArray *items = [origItems isKindOfClass:[NSArray class]]
+        ? [origItems mutableCopy]
+        : [NSMutableArray array];
 
-- (id)v2v_operationMenuItems {
-    id origItems = [self v2v_operationMenuItems];
-    id msgWrap = V2V_ExtractMsgWrapFromCellView(self);
-    if (!msgWrap) return origItems;
+    // 防止子类调用 super 时重复添加两个「转语音条」
+    for (id existing in items) {
+        @try {
+            NSString *t = [existing valueForKey:@"title"];
+            if ([t isEqualToString:@"转语音条"]) {
+                return items;
+            }
+        } @catch (NSException *e) {}
+    }
 
+    id msgWrap = V2V_ExtractMsgWrapFromCellView(cellView);
     NSInteger msgType = 0;
     @try {
         msgType = [[msgWrap valueForKey:@"m_uiMessageType"] integerValue];
     } @catch (NSException *e) {}
 
-    // 43 = 聊天视频消息，62 = 小视频消息
-    if (msgType == 43 || msgType == 62) {
-        id menuItem = V2V_CreateMenuItem(self, @selector(v2v_onTapConvertVideoToVoice));
+    NSString *clsName = NSStringFromClass([cellView class]);
+    BOOL isVideoCell = (msgType == 43 || msgType == 62 ||
+                        [clsName containsString:@"VideoMessageCell"] ||
+                        [clsName containsString:@"SightMessageCell"]);
+
+    if (isVideoCell) {
+        id menuItem = V2V_CreateMenuItem(cellView, @selector(v2v_onTapConvertVideoToVoice));
         if (menuItem) {
-            NSMutableArray *items = [origItems isKindOfClass:[NSArray class]]
-                ? [origItems mutableCopy]
-                : [NSMutableArray array];
             [items addObject:menuItem];
-            return items;
         }
     }
-    return origItems;
+    return items;
+}
+
+@implementation NSObject (V2VVideoCellMenuHook)
+
+- (id)v2v_video_operationMenuItems {
+    id origItems = [self v2v_video_operationMenuItems];
+    return V2V_AppendMenuIfNeeded(self, origItems);
+}
+
+- (id)v2v_sight_operationMenuItems {
+    id origItems = [self v2v_sight_operationMenuItems];
+    return V2V_AppendMenuIfNeeded(self, origItems);
+}
+
+- (id)v2v_common_operationMenuItems {
+    id origItems = [self v2v_common_operationMenuItems];
+    return V2V_AppendMenuIfNeeded(self, origItems);
 }
 
 - (void)v2v_onTapConvertVideoToVoice {
-    UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
     [feedback impactOccurred];
     id msgWrap = V2V_ExtractMsgWrapFromCellView(self);
     V2V_ProcessAndSendVideoWrap(msgWrap);
@@ -514,11 +562,21 @@ static id V2V_ExtractMsgWrapFromCellView(id cellView) {
 __attribute__((constructor))
 static void V2VPluginInit(void) {
     @autoreleasepool {
-        Class commonCellCls = objc_getClass("CommonMessageCellView");
         SEL menuSel = NSSelectorFromString(@"operationMenuItems");
 
+        Class videoCellCls = objc_getClass("VideoMessageCellView");
+        if (videoCellCls && class_getInstanceMethod(videoCellCls, menuSel)) {
+            V2V_SwizzleMethod(videoCellCls, menuSel, @selector(v2v_video_operationMenuItems));
+        }
+
+        Class sightCellCls = objc_getClass("SightMessageCellView");
+        if (sightCellCls && class_getInstanceMethod(sightCellCls, menuSel)) {
+            V2V_SwizzleMethod(sightCellCls, menuSel, @selector(v2v_sight_operationMenuItems));
+        }
+
+        Class commonCellCls = objc_getClass("CommonMessageCellView");
         if (commonCellCls && class_getInstanceMethod(commonCellCls, menuSel)) {
-            V2V_SwizzleMethod(commonCellCls, menuSel, @selector(v2v_operationMenuItems));
+            V2V_SwizzleMethod(commonCellCls, menuSel, @selector(v2v_common_operationMenuItems));
         }
     }
 }
